@@ -16,12 +16,12 @@ permissions:
   issues: write
 
 jobs:
-  manage-v050:
+  manage-work:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -42,84 +42,100 @@ jobs:
 
           MILESTONE="v0.5.0 — Weapon System Expansion"
 
-          PARENT_LABELS=(
-            "v0.5.0"
-            "weapon-system"
-            "feature"
-            "milestone"
-          )
-
-          BRANCHES=(
-            "feature/v0.5.0/weapon-sandbox"
-            "feature/v0.5.0/two-weapon-system"
-            "feature/v0.5.0/ads-hip-fire"
-            "feature/v0.5.0/weapon-pickups"
-            "feature/v0.5.0/weapon-presentation"
-            "feature/v0.5.0/weapon-integration"
-            "release/v0.5.0"
-          )
-
           # ------------------------------------------------------------------
-          # Helpers
+          # LABELS
+          #
+          # Existing labels are UPDATED rather than recreated.
+          # This makes the workflow safe to run multiple times.
           # ------------------------------------------------------------------
-
-          find_issue() {
-            local title="$1"
-
-            gh api \
-              --paginate \
-              "repos/${REPO}/issues?state=all&per_page=100" \
-              --jq --arg title "$title" \
-              '.[] | select(.pull_request == null and .title == $title) | .number' \
-              | head -n 1
-          }
-
-          get_milestone_number() {
-            gh api \
-              --paginate \
-              "repos/${REPO}/milestones?state=all&per_page=100" \
-              --jq --arg title "$MILESTONE" \
-              '.[] | select(.title == $title) | .number' \
-              | head -n 1
-          }
 
           ensure_label() {
             local name="$1"
             local color="$2"
             local description="$3"
 
-            if ! gh label list \
-              --repo "$REPO" \
-              --limit 100 \
-              --json name \
-              --jq --arg name "$name" \
-              '.[] | select(.name == $name) | .name' \
-              | grep -Fxq "$name"; then
+            local encoded_name
+            encoded_name="$(jq -rn --arg name "$name" '$name | @uri')"
 
-              gh label create "$name" \
-                --repo "$REPO" \
-                --color "$color" \
-                --description "$description"
+            if gh api \
+              "repos/${REPO}/labels/${encoded_name}" \
+              >/dev/null 2>&1; then
+
+              echo "Updating existing label: $name"
+
+              gh api \
+                --method PATCH \
+                "repos/${REPO}/labels/${encoded_name}" \
+                -f new_name="$name" \
+                -f color="$color" \
+                -f description="$description" \
+                >/dev/null
+
+            else
+
+              echo "Creating label: $name"
+
+              gh api \
+                --method POST \
+                "repos/${REPO}/labels" \
+                -f name="$name" \
+                -f color="$color" \
+                -f description="$description" \
+                >/dev/null
+
             fi
+          }
+
+          # ------------------------------------------------------------------
+          # MILESTONE
+          #
+          # Existing milestone is UPDATED instead of creating a duplicate.
+          # ------------------------------------------------------------------
+
+          get_milestone_number() {
+            gh api \
+              --paginate \
+              "repos/${REPO}/milestones?state=all&per_page=100" |
+              jq -r --arg title "$MILESTONE" '
+                .[] |
+                select(.title == $title) |
+                .number
+              ' |
+              head -n 1
           }
 
           ensure_milestone() {
             local milestone_number
+            local description
+
+            description="Expand the FPS weapon system with multiple weapons, active swapping, ADS, pickups, animation, audio, and final integration."
 
             milestone_number="$(get_milestone_number || true)"
 
-            if [ -z "$milestone_number" ]; then
+            if [ -n "$milestone_number" ]; then
+
+              echo "Milestone already exists: #$milestone_number"
+              echo "Updating milestone: $MILESTONE"
+
+              gh api \
+                --method PATCH \
+                "repos/${REPO}/milestones/${milestone_number}" \
+                -f title="$MILESTONE" \
+                -f description="$description" \
+                >/dev/null
+
+            else
+
               echo "Creating milestone: $MILESTONE"
 
               gh api \
                 --method POST \
                 "repos/${REPO}/milestones" \
                 -f title="$MILESTONE" \
-                -f description="Expand the FPS weapon system with multiple weapons, active swapping, ADS, pickups, animation, audio, and final integration."
+                -f description="$description" \
+                >/dev/null
 
               milestone_number="$(get_milestone_number || true)"
-            else
-              echo "Milestone already exists: #$milestone_number"
             fi
 
             if [ -z "$milestone_number" ]; then
@@ -128,7 +144,36 @@ jobs:
             fi
 
             echo "Using milestone #$milestone_number"
+
+            MILESTONE_NUMBER="$milestone_number"
           }
+
+          # ------------------------------------------------------------------
+          # ISSUE LOOKUP
+          #
+          # Searches ALL issues, including closed issues.
+          # Pull requests are explicitly excluded.
+          # ------------------------------------------------------------------
+
+          find_issue() {
+            local title="$1"
+
+            gh api \
+              --paginate \
+              "repos/${REPO}/issues?state=all&per_page=100" |
+              jq -r --arg title "$title" '
+                .[] |
+                select(.pull_request == null and .title == $title) |
+                .number
+              ' |
+              head -n 1
+          }
+
+          # ------------------------------------------------------------------
+          # ISSUE CREATION / UPDATE
+          #
+          # Existing issues are UPDATED rather than skipped.
+          # ------------------------------------------------------------------
 
           create_issue() {
             local title="$1"
@@ -137,95 +182,221 @@ jobs:
             local milestone_number="$4"
 
             local existing
+            local labels_json
+
             existing="$(find_issue "$title" || true)"
 
+            labels_json="$(
+              printf '%s' "$labels_csv" |
+              tr ',' '\n' |
+              jq -R . |
+              jq -s .
+            )"
+
             if [ -n "$existing" ]; then
-              echo "Issue already exists: #$existing — $title"
-              return 0
+
+              echo "Issue already exists: #$existing"
+              echo "Updating issue: $title"
+
+              jq -n \
+                --arg body "$body" \
+                --argjson labels "$labels_json" \
+                --argjson milestone "$milestone_number" \
+                '{
+                  body: $body,
+                  labels: $labels,
+                  milestone: $milestone
+                }' |
+              gh api \
+                --method PATCH \
+                "repos/${REPO}/issues/${existing}" \
+                --input - \
+                >/dev/null
+
+              echo "Updated issue #$existing"
+
+            else
+
+              echo "Creating issue: $title"
+
+              jq -n \
+                --arg title "$title" \
+                --arg body "$body" \
+                --argjson labels "$labels_json" \
+                --argjson milestone "$milestone_number" \
+                '{
+                  title: $title,
+                  body: $body,
+                  labels: $labels,
+                  milestone: $milestone
+                }' |
+              gh api \
+                --method POST \
+                "repos/${REPO}/issues" \
+                --input - \
+                >/dev/null
+
+              echo "Created issue: $title"
+
             fi
-
-            echo "Creating issue: $title"
-
-            # IMPORTANT:
-            # Create the issue directly through the GitHub REST API.
-            # This avoids the previous workflow's gh issue create /
-            # command-substitution failure behavior.
-            gh api \
-              --method POST \
-              "repos/${REPO}/issues" \
-              -f title="$title" \
-              -f body="$body" \
-              -f labels="$labels_csv" \
-              -F milestone="$milestone_number"
-
-            echo "Created issue: $title"
           }
+
+          # ------------------------------------------------------------------
+          # BRANCH CREATION / RESET
+          #
+          # If a branch already exists, it is reset to the current default
+          # branch. This intentionally overwrites an existing v0.5.0 branch.
+          #
+          # WARNING:
+          # Existing commits on these release-management branches will be
+          # discarded if they are not present on the default branch.
+          # ------------------------------------------------------------------
 
           create_branch() {
             local branch="$1"
 
-            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-              echo "Branch already exists: $branch"
-              return 0
-            fi
-
-            echo "Creating branch: $branch"
+            echo "Preparing branch: $branch"
 
             git fetch origin "$DEFAULT_BRANCH"
-            git checkout "$DEFAULT_BRANCH"
-            git reset --hard "origin/$DEFAULT_BRANCH"
 
-            git checkout -b "$branch"
-            git push origin "$branch"
-            git checkout "$DEFAULT_BRANCH"
+            if git ls-remote \
+              --exit-code \
+              --heads \
+              origin \
+              "$branch" \
+              >/dev/null 2>&1; then
 
-            echo "Created branch: $branch"
+              echo "Branch already exists: $branch"
+              echo "Resetting branch to origin/$DEFAULT_BRANCH"
+
+              git push \
+                --force \
+                origin \
+                "origin/${DEFAULT_BRANCH}:refs/heads/${branch}"
+
+              echo "Reset existing branch: $branch"
+
+            else
+
+              echo "Creating branch: $branch"
+
+              git push \
+                origin \
+                "origin/${DEFAULT_BRANCH}:refs/heads/${branch}"
+
+              echo "Created branch: $branch"
+
+            fi
           }
+
+          # ------------------------------------------------------------------
+          # CLOSE ISSUE
+          #
+          # Used only by rollback.
+          # ------------------------------------------------------------------
 
           close_issue_if_exists() {
             local title="$1"
-            local number
+            local existing
 
-            number="$(find_issue "$title" || true)"
+            existing="$(find_issue "$title" || true)"
 
-            if [ -n "$number" ]; then
-              echo "Closing issue #$number — $title"
-              gh issue close "$number" \
-                --repo "$REPO" \
-                --reason "not planned" || true
+            if [ -n "$existing" ]; then
+
+              echo "Closing issue #$existing: $title"
+
+              gh api \
+                --method PATCH \
+                "repos/${REPO}/issues/${existing}" \
+                -f state="closed" \
+                >/dev/null
+
+            else
+
+              echo "Issue does not exist: $title"
+
             fi
           }
+
+          # ------------------------------------------------------------------
+          # DELETE BRANCH
+          #
+          # Used only by rollback.
+          # ------------------------------------------------------------------
 
           delete_branch_if_exists() {
             local branch="$1"
 
-            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            if git ls-remote \
+              --exit-code \
+              --heads \
+              origin \
+              "$branch" \
+              >/dev/null 2>&1; then
+
               echo "Deleting branch: $branch"
-              git push origin --delete "$branch"
+
+              git push \
+                origin \
+                --delete \
+                "$branch"
+
             else
+
               echo "Branch does not exist: $branch"
+
             fi
           }
 
           # ------------------------------------------------------------------
-          # CREATE
-          #
-          # IMPORTANT DESIGN:
-          # The "daily milestones" are Markdown checkboxes INSIDE the parent
-          # issue. They are NOT separate GitHub issues.
+          # CREATE V0.5.0 WORK
           # ------------------------------------------------------------------
 
           create_work() {
-            ensure_label "v0.5.0" "5319E7" "Work targeted for version 0.5.0"
-            ensure_label "weapon-system" "B60205" "Weapon system development"
-            ensure_label "feature" "0E8A16" "New gameplay functionality"
-            ensure_label "milestone" "FBCA04" "Multi-day development ticket"
-            ensure_label "priority-high" "D93F0B" "High priority work"
-            ensure_label "priority-medium" "F9D0C4" "Medium priority work"
+
+            echo "=========================================="
+            echo "Beginning v0.5.0 creation..."
+            echo "=========================================="
+
+            # --------------------------------------------------------------
+            # Labels
+            # --------------------------------------------------------------
+
+            ensure_label \
+              "v0.5.0" \
+              "5319E7" \
+              "Work targeted for version 0.5.0"
+
+            ensure_label \
+              "weapon-system" \
+              "B60205" \
+              "Weapon system development"
+
+            ensure_label \
+              "feature" \
+              "0E8A16" \
+              "New gameplay functionality"
+
+            ensure_label \
+              "milestone" \
+              "FBCA04" \
+              "Multi-day development ticket"
+
+            ensure_label \
+              "priority-high" \
+              "D93F0B" \
+              "High priority work"
+
+            ensure_label \
+              "priority-medium" \
+              "F9D0C4" \
+              "Medium priority work"
+
+            # --------------------------------------------------------------
+            # Milestone
+            # --------------------------------------------------------------
 
             ensure_milestone
-
-            MILESTONE_NUMBER="$(get_milestone_number)"
 
             # --------------------------------------------------------------
             # Ticket 1
@@ -260,7 +431,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-high" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/weapon-sandbox"
+            create_branch \
+              "feature/v0.5.0/weapon-sandbox"
 
             # --------------------------------------------------------------
             # Ticket 2
@@ -277,7 +449,7 @@ jobs:
           - [ ] Create primary and secondary weapon slots.
           - [ ] Implement a single active-weapon state.
           - [ ] Implement weapon swapping input.
-          - [ ] Preserve each weapon''s ammo and relevant state while inactive.
+          - [ ] Preserve each weapon'\''s ammo and relevant state while inactive.
           - [ ] Test rapid swapping and edge cases.
 
           ## Acceptance Criteria
@@ -295,7 +467,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-high" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/two-weapon-system"
+            create_branch \
+              "feature/v0.5.0/two-weapon-system"
 
             # --------------------------------------------------------------
             # Ticket 3
@@ -330,7 +503,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-high" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/ads-hip-fire"
+            create_branch \
+              "feature/v0.5.0/ads-hip-fire"
 
             # --------------------------------------------------------------
             # Ticket 4
@@ -365,7 +539,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-medium" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/weapon-pickups"
+            create_branch \
+              "feature/v0.5.0/weapon-pickups"
 
             # --------------------------------------------------------------
             # Ticket 5
@@ -401,7 +576,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-medium" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/weapon-presentation"
+            create_branch \
+              "feature/v0.5.0/weapon-presentation"
 
             # --------------------------------------------------------------
             # Ticket 6
@@ -439,10 +615,11 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-high" \
               "$MILESTONE_NUMBER"
 
-            create_branch "feature/v0.5.0/weapon-integration"
+            create_branch \
+              "feature/v0.5.0/weapon-integration"
 
             # --------------------------------------------------------------
-            # Release ticket
+            # Release Ticket
             # --------------------------------------------------------------
 
             create_issue \
@@ -469,8 +646,8 @@ jobs:
               "v0.5.0,weapon-system,feature,milestone,priority-high" \
               "$MILESTONE_NUMBER"
 
-            echo "Creating release branch..."
-            create_branch "release/v0.5.0"
+            create_branch \
+              "release/v0.5.0"
 
             echo "=========================================="
             echo "v0.5.0 creation completed successfully."
@@ -480,12 +657,15 @@ jobs:
           # ------------------------------------------------------------------
           # ROLLBACK
           #
-          # Closes old issues instead of deleting them, and deletes branches.
-          # This also cleans up the OLD workflow's individual sub-issues.
+          # Closes old issues instead of deleting them.
+          # Deletes v0.5.0 branches.
           # ------------------------------------------------------------------
 
           rollback_work() {
+
+            echo "=========================================="
             echo "Beginning v0.5.0 rollback..."
+            echo "=========================================="
 
             OLD_ISSUES=(
               "[v0.5.0] Define WeaponData ScriptableObject"
@@ -524,13 +704,35 @@ jobs:
               "[v0.5.0] Weapon System Expansion Release Integration"
             )
 
+            BRANCHES=(
+              "feature/v0.5.0/weapon-sandbox"
+              "feature/v0.5.0/two-weapon-system"
+              "feature/v0.5.0/ads-hip-fire"
+              "feature/v0.5.0/weapon-pickups"
+              "feature/v0.5.0/weapon-presentation"
+              "feature/v0.5.0/weapon-integration"
+              "release/v0.5.0"
+            )
+
+            # --------------------------------------------------------------
+            # Close old individual issues
+            # --------------------------------------------------------------
+
             for title in "${OLD_ISSUES[@]}"; do
               close_issue_if_exists "$title"
             done
 
+            # --------------------------------------------------------------
+            # Close the new parent issues
+            # --------------------------------------------------------------
+
             for title in "${NEW_PARENT_ISSUES[@]}"; do
               close_issue_if_exists "$title"
             done
+
+            # --------------------------------------------------------------
+            # Delete v0.5.0 branches
+            # --------------------------------------------------------------
 
             for branch in "${BRANCHES[@]}"; do
               delete_branch_if_exists "$branch"
@@ -543,15 +745,23 @@ jobs:
             echo "=========================================="
           }
 
+          # ------------------------------------------------------------------
+          # ACTION DISPATCH
+          # ------------------------------------------------------------------
+
           case "$ACTION" in
+
             create)
               create_work
               ;;
+
             rollback)
               rollback_work
               ;;
+
             *)
-              echo "ERROR: Unknown action '$ACTION'."
+              echo "ERROR: Unknown action '$ACTION'"
               exit 1
               ;;
+
           esac
