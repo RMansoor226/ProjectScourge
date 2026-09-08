@@ -1,0 +1,487 @@
+name: Create v0.5.0 Weapon System Issues
+
+on:
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  create-issues:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create v0.5.0 issues and labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MILESTONE="v0.5.0 — Weapon System Expansion"
+
+          echo "=========================================="
+          echo "Creating v0.5.0 labels and issues"
+          echo "=========================================="
+
+          # ================================================================
+          # LABEL MANAGEMENT
+          #
+          # If the label already exists, update it.
+          # If it does not exist, create it.
+          # ================================================================
+
+          ensure_label() {
+              local name="$1"
+              local color="$2"
+              local description="$3"
+
+              local encoded_name
+
+              encoded_name="$(jq -rn --arg value "$name" '$value | @uri')"
+
+              if gh api \
+                  "repos/${REPO}/labels/${encoded_name}" \
+                  >/dev/null 2>&1
+              then
+                  echo "Label already exists: $name"
+                  echo "Updating label: $name"
+
+                  gh api \
+                      --method PATCH \
+                      "repos/${REPO}/labels/${encoded_name}" \
+                      -f new_name="$name" \
+                      -f color="$color" \
+                      -f description="$description" \
+                      >/dev/null
+              else
+                  echo "Creating label: $name"
+
+                  gh api \
+                      --method POST \
+                      "repos/${REPO}/labels" \
+                      -f name="$name" \
+                      -f color="$color" \
+                      -f description="$description" \
+                      >/dev/null
+              fi
+          }
+
+          # ================================================================
+          # CREATE / UPDATE LABELS
+          # ================================================================
+
+          ensure_label \
+              "v0.5.0" \
+              "5319E7" \
+              "Work targeted for version 0.5.0"
+
+          ensure_label \
+              "weapon-system" \
+              "B60205" \
+              "Weapon system development"
+
+          ensure_label \
+              "feature" \
+              "0E8A16" \
+              "New gameplay functionality"
+
+          ensure_label \
+              "milestone" \
+              "FBCA04" \
+              "Multi-day development ticket"
+
+          ensure_label \
+              "priority-high" \
+              "D93F0B" \
+              "High priority work"
+
+          ensure_label \
+              "priority-medium" \
+              "F9D0C4" \
+              "Medium priority work"
+
+          # ================================================================
+          # MILESTONE
+          #
+          # The milestone is also handled idempotently.
+          # ================================================================
+
+          get_milestone_number() {
+              gh api \
+                  --paginate \
+                  "repos/${REPO}/milestones?state=all&per_page=100" |
+                  jq -r --arg title "$MILESTONE" '
+                      .[] |
+                      select(.title == $title) |
+                      .number
+                  ' |
+                  head -n 1
+          }
+
+          ensure_milestone() {
+              local milestone_number
+
+              milestone_number="$(get_milestone_number || true)"
+
+              if [ -n "$milestone_number" ]; then
+                  echo "Milestone already exists: #$milestone_number"
+              else
+                  echo "Creating milestone: $MILESTONE"
+
+                  gh api \
+                      --method POST \
+                      "repos/${REPO}/milestones" \
+                      -f title="$MILESTONE" \
+                      -f description="Expand the FPS weapon system with multiple weapons, active swapping, ADS, pickups, animation, audio, and integration." \
+                      >/dev/null
+
+                  milestone_number="$(get_milestone_number || true)"
+              fi
+
+              if [ -z "$milestone_number" ]; then
+                  echo "ERROR: Could not find or create milestone."
+                  exit 1
+              fi
+
+              echo "Using milestone #$milestone_number"
+
+              MILESTONE_NUMBER="$milestone_number"
+          }
+
+          ensure_milestone
+
+          # ================================================================
+          # FIND EXISTING ISSUE
+          #
+          # Searches both open and closed issues.
+          #
+          # Pull requests are explicitly ignored.
+          # ================================================================
+
+          find_issue() {
+              local title="$1"
+
+              gh api \
+                  --paginate \
+                  "repos/${REPO}/issues?state=all&per_page=100" |
+                  jq -r --arg title "$title" '
+                      .[] |
+                      select(.pull_request == null) |
+                      select(.title == $title) |
+                      .number
+                  ' |
+                  head -n 1
+          }
+
+          # ================================================================
+          # CREATE / UPDATE ISSUE
+          #
+          # Existing issues are updated instead of duplicated.
+          # Closed issues are reopened.
+          # ================================================================
+
+          ensure_issue() {
+              local title="$1"
+              local body="$2"
+              local labels="$3"
+
+              local issue_number
+              local labels_json
+
+              issue_number="$(find_issue "$title" || true)"
+
+              labels_json="$(
+                  printf '%s' "$labels" |
+                  tr ',' '\n' |
+                  jq -R . |
+                  jq -s .
+              )"
+
+              if [ -n "$issue_number" ]; then
+
+                  echo "=========================================="
+                  echo "Issue already exists: #$issue_number"
+                  echo "Updating: $title"
+                  echo "=========================================="
+
+                  # Update title/body/labels/milestone.
+                  jq -n \
+                      --arg body "$body" \
+                      --argjson labels "$labels_json" \
+                      --argjson milestone "$MILESTONE_NUMBER" \
+                      '{
+                          body: $body,
+                          labels: $labels,
+                          milestone: $milestone
+                      }' |
+                  gh api \
+                      --method PATCH \
+                      "repos/${REPO}/issues/${issue_number}" \
+                      --input - \
+                      >/dev/null
+
+                  # Reopen the issue if it is closed.
+                  gh api \
+                      --method PATCH \
+                      "repos/${REPO}/issues/${issue_number}" \
+                      -f state="open" \
+                      >/dev/null
+
+                  echo "Updated and reopened issue #$issue_number"
+
+              else
+
+                  echo "=========================================="
+                  echo "Creating issue: $title"
+                  echo "=========================================="
+
+                  jq -n \
+                      --arg title "$title" \
+                      --arg body "$body" \
+                      --argjson labels "$labels_json" \
+                      --argjson milestone "$MILESTONE_NUMBER" \
+                      '{
+                          title: $title,
+                          body: $body,
+                          labels: $labels,
+                          milestone: $milestone
+                      }' |
+                  gh api \
+                      --method POST \
+                      "repos/${REPO}/issues" \
+                      --input - \
+                      >/dev/null
+
+                  echo "Created issue: $title"
+
+              fi
+          }
+
+          # ================================================================
+          # ISSUE 1
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Expand weapon sandbox with multiple weapon prefabs" \
+              '## Goal
+
+          Expand the current weapon sandbox into a reusable system capable of supporting multiple weapon prefabs through ScriptableObjects, models, and shared weapon behavior.
+
+          > **Completed prerequisite:** WeaponData ScriptableObject creation is already complete and is intentionally NOT a milestone in this ticket.
+
+          ## Daily Milestones
+
+          - [ ] Create the reusable weapon prefab structure.
+          - [ ] Add and configure multiple weapon models.
+          - [ ] Connect weapon-specific stats to the existing WeaponData ScriptableObjects.
+          - [ ] Test multiple weapons independently in the sandbox.
+
+          ## Acceptance Criteria
+
+          - At least 3 distinct weapon configurations can exist.
+          - Existing WeaponData assets drive weapon-specific configuration.
+          - Weapon prefabs share reusable weapon behavior.
+          - Models, muzzle points, audio references, and weapon data can be configured independently.
+          - Existing firing, reload, ammo, damage, and effects continue to work.
+
+          ## Branch
+
+          `feature/v0.5.0/weapon-sandbox`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-high"
+
+          # ================================================================
+          # ISSUE 2
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Implement two-weapon system with active weapon swapping" \
+              '## Goal
+
+          Allow the player to carry two weapons simultaneously and switch between them during gameplay.
+
+          ## Daily Milestones
+
+          - [ ] Create primary and secondary weapon slots.
+          - [ ] Implement a single active-weapon state.
+          - [ ] Implement weapon swapping input.
+          - [ ] Preserve each weapon'\''s ammo and relevant state while inactive.
+          - [ ] Test rapid swapping and edge cases.
+
+          ## Acceptance Criteria
+
+          - The player can carry two distinct weapons.
+          - Only the active weapon is visually equipped.
+          - The player can swap between weapon slots.
+          - Each weapon maintains its own ammo state.
+          - Firing and reloading operate on the active weapon only.
+          - Weapon swapping cannot create duplicate or invalid weapon states.
+
+          ## Branch
+
+          `feature/v0.5.0/two-weapon-system`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-high"
+
+          # ================================================================
+          # ISSUE 3
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Implement ADS and hip-fire mechanics" \
+              '## Goal
+
+          Add a weapon aiming system supporting normal hip fire and aiming down sights.
+
+          ## Daily Milestones
+
+          - [ ] Add ADS input and weapon aiming state.
+          - [ ] Implement ADS camera and weapon positioning.
+          - [ ] Add separate hip-fire and ADS sensitivity.
+          - [ ] Integrate ADS with firing and recoil.
+          - [ ] Define ADS behavior during reloads and weapon swaps.
+
+          ## Acceptance Criteria
+
+          - The player can enter and exit ADS.
+          - ADS changes weapon/camera presentation smoothly.
+          - Hip fire remains the default state.
+          - ADS sensitivity can differ from hip-fire sensitivity.
+          - Firing works correctly in both states.
+          - Reloading and swapping handle ADS safely.
+
+          ## Branch
+
+          `feature/v0.5.0/ads-hip-fire`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-high"
+
+          # ================================================================
+          # ISSUE 4
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Implement weapon pickup mechanics" \
+              '## Goal
+
+          Allow weapons to exist in the world and be picked up by the player.
+
+          ## Daily Milestones
+
+          - [ ] Create a reusable world weapon pickup prefab.
+          - [ ] Add pickup detection and interaction.
+          - [ ] Add picked-up weapons to an available weapon slot.
+          - [ ] Define behavior when both weapon slots are occupied.
+          - [ ] Add pickup feedback and test pickup edge cases.
+
+          ## Acceptance Criteria
+
+          - A weapon can be placed in the world as a pickup.
+          - The player can detect and interact with it.
+          - The weapon is added to an available slot.
+          - The pickup deactivates after acquisition.
+          - Full-inventory behavior is intentional.
+          - Pickup interaction does not duplicate weapon instances or data.
+
+          ## Branch
+
+          `feature/v0.5.0/weapon-pickups`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-medium"
+
+          # ================================================================
+          # ISSUE 5
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Expand weapon animations and sounds" \
+              '## Goal
+
+          Expand weapon presentation with animation and audio feedback for firing, reloading, ADS, swapping, empty magazines, and pickups.
+
+          ## Daily Milestones
+
+          - [ ] Expand the weapon animation state machine.
+          - [ ] Add fire, reload, and empty-magazine audio.
+          - [ ] Add ADS and weapon-swap animation/audio.
+          - [ ] Add weapon pickup feedback.
+          - [ ] Verify all weapon audio routes through AudioManager.
+
+          ## Acceptance Criteria
+
+          - Weapons have distinct firing and reload presentation.
+          - ADS has a clear visual transition.
+          - Weapon swapping has animation/audio feedback.
+          - Empty-magazine feedback exists.
+          - Pickup feedback exists.
+          - Weapon audio uses the centralized AudioManager.
+          - Animation and audio remain separated from gameplay logic.
+
+          ## Branch
+
+          `feature/v0.5.0/weapon-presentation`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-medium"
+
+          # ================================================================
+          # ISSUE 6
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Weapon system integration and gameplay polish" \
+              '## Goal
+
+          Integrate all v0.5.0 weapon features into one stable gameplay loop.
+
+          ## Daily Milestones
+
+          - [ ] Integrate the multiple-weapon sandbox with the two-slot inventory.
+          - [ ] Integrate ADS with all supported weapons.
+          - [ ] Integrate pickups with weapon swapping.
+          - [ ] Test weapon-system edge cases.
+          - [ ] Profile and clean up weapon-system performance.
+          - [ ] Validate the complete system in a standalone build.
+
+          ## Acceptance Criteria
+
+          - The complete weapon loop works from pickup to combat to swapping.
+          - Existing ammo/reload behavior remains stable.
+          - ADS works with all supported weapons.
+          - Weapon audio is routed through AudioManager.
+          - Weapon animations do not break gameplay state.
+          - Weapon swapping cannot produce duplicate, missing, or invisible weapons.
+          - No critical weapon-system bugs remain.
+          - A standalone build has been tested.
+
+          ## Branch
+
+          `feature/v0.5.0/weapon-integration`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-high"
+
+          # ================================================================
+          # ISSUE 7 — RELEASE INTEGRATION
+          # ================================================================
+
+          ensure_issue \
+              "[v0.5.0] Weapon System Expansion Release Integration" \
+              '## Goal
+
+          Stabilize and package all weapon-system work completed for v0.5.0.
+
+          ## Release Checklist
+
+          - [ ] Multiple weapon prefabs and existing WeaponData assets work correctly.
+          - [ ] Two weapon slots and active swapping work.
+          - [ ] ADS and hip fire work correctly.
+          - [ ] World weapon pickups work.
+          - [ ] Weapon animation and audio are integrated.
+          - [ ] Edge cases have been tested.
+          - [ ] Performance has been checked.
+          - [ ] A standalone build has been validated.
+          - [ ] No critical weapon-system bugs remain.
+
+          ## Recommended Release Branch
+
+          `release/v0.5.0`' \
+              "v0.5.0,weapon-system,feature,milestone,priority-high"
+
+          echo "=========================================="
+          echo "v0.5.0 issues and labels completed."
+          echo "=========================================="
