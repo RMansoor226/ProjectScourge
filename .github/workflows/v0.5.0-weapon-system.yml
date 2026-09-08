@@ -77,47 +77,49 @@ jobs:
             local title="$1"
             local body="$2"
             local labels="$3"
-
+          
             existing="$(
               gh issue list \
                 --state all \
                 --limit 100 \
+                --search "in:title $title" \
                 --json number,title \
-                --jq --arg title "$title" \
-                '.[] | select(.title == $title) | .number' \
+                --jq ".[] | select(.title == \"$title\") | .number" \
                 | head -n 1
             )"
-
+          
             if [ -n "$existing" ]; then
               echo "$existing"
               return
             fi
-
+          
             url="$(
               gh issue create \
                 --title "$title" \
                 --body "$body" \
                 --label "$labels" \
-                --milestone "$MILESTONE_NUMBER"
+                --milestone "v0.5.0 — Weapon System Expansion"
             )"
-
+          
             echo "${url##*/}"
           }
 
           # Creates a branch from the current default branch if it does not exist.
           create_branch() {
             local branch="$1"
-
+            local default_branch="${{ github.event.repository.default_branch }}"
+          
             if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
               echo "Branch already exists: $branch"
               return
             fi
-
-            git checkout "${{ github.event.repository.default_branch }}"
-            git pull origin "${{ github.event.repository.default_branch }}"
-            git checkout -b "$branch"
+          
+            git fetch origin "$default_branch"
+          
+            git checkout -b "$branch" "origin/$default_branch"
             git push origin "$branch"
-            git checkout "${{ github.event.repository.default_branch }}"
+          
+            git checkout "$default_branch"
           }
 
           # Adds an issue as a GitHub sub-issue of a parent issue.
